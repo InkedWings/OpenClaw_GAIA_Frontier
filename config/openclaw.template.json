@@ -110,7 +110,11 @@
         "enabled": true,
         "config": {
           "webSearch": {
-            "apiKey": "${BRAVE_SEARCH_API_KEY}"
+            "apiKey": {
+              "source": "env",
+              "provider": "default",
+              "id": "BRAVE_API_KEY"
+            }
           }
         }
       }      
