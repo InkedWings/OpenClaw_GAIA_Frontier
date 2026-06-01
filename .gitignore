@@ -1,0 +1,9 @@
+runs/
+workspace/
+.local/
+data/
+.agents/
+.codex/
+*.log
+__pycache__/
+*.pyc

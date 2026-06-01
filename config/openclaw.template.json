@@ -1,0 +1,119 @@
+{
+  "meta": {
+    "lastTouchedVersion": "2026.3.28",
+    "lastTouchedAt": "2026-04-21T23:49:20.311Z"
+  },
+  "models": {
+    "providers": {
+      "vllm": {
+        "baseUrl": "http://127.0.0.1:8011/v1",
+        "apiKey": "vllm-local",
+        "api": "openai-completions",
+        "models": [
+          {
+            "id": "/lustre/orion/gen150/scratch/zye25/Agentic/hf/models/Qwen3.5-27B",
+            "name": "vLLM /lustre/orion/gen150/scratch/zye25/Agentic/hf/models/Qwen3.5-27B",
+            "reasoning": false,
+            "input": [
+              "text"
+            ],
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0
+            },
+            "contextWindow": 56320,
+            "maxTokens": 8192,
+            "compat": {
+              "supportsStore": false,
+              "supportsDeveloperRole": false,
+              "supportsStrictMode": false
+            }
+          }
+        ]
+      }
+    }
+  },
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "vllm//lustre/orion/gen150/scratch/zye25/Agentic/hf/models/Qwen3.5-27B"
+      },
+      "workspace": "/lustre/orion/gen150/scratch/zye25/Agentic/openclaw_GAIA/workspace",
+      "sandbox": {
+        "mode": "off",
+        "browser": {
+          "enabled": false
+        }
+      }
+    }
+  },
+  "tools": {
+    "profile": "full",
+    "allow": [
+      "read",
+      "edit",
+      "write",
+      "exec",
+      "process",
+      "sessions_list",
+      "sessions_history",
+      "sessions_send",
+      "sessions_spawn",
+      "session_status",
+      "memory_search",
+      "memory_get",
+      "web_search",
+      "web_fetch",
+      "subagents"
+    ],
+    "web": {
+      "search": {
+        "enabled": true,
+        "provider": "brave"
+      },
+      "fetch": {
+        "enabled": true
+      }
+    },
+    "exec": {
+      "security": "full",
+      "ask": "off"
+    }
+  },
+  "commands": {
+    "native": "auto",
+    "nativeSkills": "auto",
+    "restart": true,
+    "ownerDisplay": "raw"
+  },
+  "gateway": {
+    "mode": "local"
+  },
+  "plugins": {
+    "entries": {
+      "browser": {
+        "enabled": false,
+        "config": {}
+      },
+      "duckduckgo": {
+        "enabled": false,
+        "config": {
+          "webSearch": {
+            "region": "us-en",
+            "safeSearch": "moderate"
+          }
+        }
+      },
+      "brave": {
+        "enabled": true,
+        "config": {
+          "webSearch": {
+            "apiKey": "${BRAVE_SEARCH_API_KEY}"
+          }
+        }
+      }      
+    }
+  }
+}
