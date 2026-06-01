@@ -13,6 +13,7 @@ import json
 import os
 import queue
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -41,6 +42,167 @@ REQUEST_COUNTER_CANDIDATES = [
     "vllm_request_success_total",
     "vllm_request_completed_total",
 ]
+
+CPU_SAMPLE_SCRIPT = r"""
+python3 - <<'PY'
+import glob
+import json
+import os
+import time
+from pathlib import Path
+
+
+def read_text(path):
+    try:
+        return Path(path).read_text(encoding="utf-8", errors="ignore").strip()
+    except Exception:
+        return ""
+
+
+def read_float(path):
+    txt = read_text(path)
+    if not txt:
+        return None
+    try:
+        return float(txt)
+    except Exception:
+        return None
+
+
+def read_proc_stat():
+    line = read_text("/proc/stat").splitlines()[0]
+    parts = line.split()
+    vals = [float(x) for x in parts[1:]]
+    idle = vals[3] + (vals[4] if len(vals) > 4 else 0.0)
+    total = sum(vals)
+    return total, idle
+
+
+def read_powercap_energy():
+    out = {}
+    for energy_path in glob.glob("/sys/class/powercap/*/energy_uj"):
+        root = Path(energy_path).parent
+        name = read_text(root / "name") or root.name
+        energy = read_float(energy_path)
+        if energy is None:
+            continue
+        max_range = read_float(root / "max_energy_range_uj")
+        out[str(root)] = {
+            "name": name,
+            "energy_uj": energy,
+            "max_energy_range_uj": max_range,
+        }
+    return out
+
+
+def compute_powercap_watts(start, end, elapsed_s):
+    watts = []
+    for key, a in start.items():
+        b = end.get(key)
+        if not b:
+            continue
+        delta = b["energy_uj"] - a["energy_uj"]
+        max_range = a.get("max_energy_range_uj")
+        if delta < 0 and max_range:
+            delta += max_range
+        if delta < 0 or elapsed_s <= 0:
+            continue
+        watts.append({
+            "name": a.get("name") or key,
+            "watts": (delta / 1_000_000.0) / elapsed_s,
+        })
+    return watts
+
+
+def read_cray_cpu_power():
+    # On Cray EX systems, these counters may exist and are the best CPU-power source.
+    for path in (
+        "/sys/cray/pm_counters/cpu_power",
+        "/sys/cray/pm_counters/cpu_power_watts",
+    ):
+        val = read_float(path)
+        if val is not None:
+            return val, path
+    return None, ""
+
+
+def read_hwmon_cpu_power():
+    vals = []
+    for hwmon in glob.glob("/sys/class/hwmon/hwmon*"):
+        name = (read_text(Path(hwmon) / "name") or "").lower()
+        if not any(marker in name for marker in ("cpu", "amd_energy", "k10temp")):
+            continue
+        for p in glob.glob(f"{hwmon}/power*_input"):
+            val = read_float(p)
+            if val is None:
+                continue
+            vals.append({"name": name or Path(hwmon).name, "watts": val / 1_000_000.0})
+    return vals
+
+
+errors = []
+try:
+    stat0 = read_proc_stat()
+except Exception as exc:
+    stat0 = None
+    errors.append(f"proc_stat_start: {exc}")
+energy0 = read_powercap_energy()
+t0 = time.time()
+time.sleep(0.25)
+try:
+    stat1 = read_proc_stat()
+except Exception as exc:
+    stat1 = None
+    errors.append(f"proc_stat_end: {exc}")
+energy1 = read_powercap_energy()
+t1 = time.time()
+
+cpu_use_pct = None
+if stat0 and stat1:
+    total_delta = stat1[0] - stat0[0]
+    idle_delta = stat1[1] - stat0[1]
+    if total_delta > 0:
+        cpu_use_pct = max(0.0, min(100.0, 100.0 * (1.0 - idle_delta / total_delta)))
+
+load1 = load5 = load15 = None
+try:
+    parts = read_text("/proc/loadavg").split()
+    load1, load5, load15 = float(parts[0]), float(parts[1]), float(parts[2])
+except Exception as exc:
+    errors.append(f"loadavg: {exc}")
+
+cpu_power_w = None
+cpu_power_source = ""
+cray_power, cray_source = read_cray_cpu_power()
+if cray_power is not None:
+    cpu_power_w = cray_power
+    cpu_power_source = cray_source
+else:
+    powercap = compute_powercap_watts(energy0, energy1, max(0.000001, t1 - t0))
+    if powercap:
+        cpu_power_w = sum(item["watts"] for item in powercap)
+        cpu_power_source = "powercap:" + ",".join(item["name"] for item in powercap)
+    else:
+        hwmon = read_hwmon_cpu_power()
+        if hwmon:
+            cpu_power_w = sum(item["watts"] for item in hwmon)
+            cpu_power_source = "hwmon:" + ",".join(item["name"] for item in hwmon)
+        else:
+            errors.append("cpu_power_unavailable")
+
+print(json.dumps({
+    "hostname": os.uname().nodename,
+    "cpu_count": os.cpu_count(),
+    "cpu_use_pct": cpu_use_pct,
+    "load1": load1,
+    "load5": load5,
+    "load15": load15,
+    "cpu_power_w": cpu_power_w,
+    "cpu_power_source": cpu_power_source,
+    "errors": errors,
+}))
+PY
+"""
 
 
 @dataclass
@@ -140,6 +302,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--quantile-method", default="nearest-rank")
     parser.add_argument("--session-store", default="")
+    parser.add_argument("--external-base-url", default="", help="Use an already-running vLLM backend instead of starting/stopping one.")
+    parser.add_argument("--external-vllm-log", default="", help="Path to the vLLM log for --external-base-url runs.")
+    parser.add_argument("--remote-runner", choices=["srun", "ssh"], default="srun", help="How node-local health and sampler commands are run.")
+    parser.add_argument("--skip-slurm-validation", action="store_true", help="Skip squeue validation, useful with --remote-runner ssh.")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--python-bin", default="/lustre/orion/gen150/scratch/zye25/conda-envs/AGAI/bin/python")
     parser.add_argument("--openclaw-bin", default=str(openclaw_root / ".local" / "npm" / "lib" / "node_modules" / "openclaw" / "openclaw.mjs"))
@@ -208,6 +374,8 @@ def run_cmd(cmd: List[str], timeout: Optional[int] = None, env: Optional[Dict[st
 
 
 def run_srun(job_id: int, node: str, script: str, timeout: int = 20) -> subprocess.CompletedProcess:
+    if os.environ.get("GAIA_REMOTE_RUNNER") == "ssh" or int(job_id) <= 0:
+        return run_cmd(["ssh", node, f"bash -lc {shlex.quote(script)}"], timeout=timeout)
     cmd = [
         "srun",
         "--overlap",
@@ -344,6 +512,9 @@ def start_backend(args: argparse.Namespace, tp: int, run_tag: str, work_root: Pa
             "GPU_MEMORY_UTILIZATION": str(args.gpu_mem_util),
             "MAX_MODEL_LEN": str(args.max_model_len),
             "RUN_TAG": run_tag,
+            "VLLM_CACHE_DIR": os.environ.get("VLLM_CACHE_DIR") or str(work_root / ".cache" / "vllm"),
+            "TRITON_CACHE_DIR": os.environ.get("TRITON_CACHE_DIR") or "/tmp/triton/cache",
+            "MIOPEN_CACHE_DIR": os.environ.get("MIOPEN_CACHE_DIR") or f"/tmp/{os.environ.get('USER', 'user')}/openclaw_miopen_cache",
             "READY_TIMEOUT_S": str(args.backend_ready_timeout_s),
             "WAIT_BACKENDS_READY": "1",
             "ENFORCE_EAGER": "1" if args.enforce_eager else "0",
@@ -624,6 +795,16 @@ def resolve_session_file(runtime_home: Path, session_store: Path, session_id: st
 
 def create_worker_config(template_cfg: Path, out_cfg: Path, workspace: Path, base_url: str, model_id: str, api_key: str, context_window: int, model_max_tokens: int) -> None:
     cfg = json.loads(template_cfg.read_text(encoding="utf-8"))
+    brave_api_key = os.environ.get("BRAVE_API_KEY", "").strip()
+    if brave_api_key:
+        web_search_cfg = (
+            cfg.setdefault("plugins", {})
+            .setdefault("entries", {})
+            .setdefault("brave", {})
+            .setdefault("config", {})
+            .setdefault("webSearch", {})
+        )
+        web_search_cfg["apiKey"] = brave_api_key
     cfg.setdefault("models", {}).setdefault("providers", {})
     cfg["models"]["providers"]["vllm"] = {
         "baseUrl": base_url,
@@ -727,6 +908,44 @@ class GPUSampler(threading.Thread):
                         self.samples.append(sample)
                 except Exception as e:
                     self.errors.append(f"gpu parse error: {e}")
+            else:
+                err = proc.stderr.strip() or proc.stdout.strip()
+                if err:
+                    self.errors.append(err[:240])
+            dt = time.time() - t0
+            sleep_s = self.interval_s - dt
+            if sleep_s > 0:
+                self.stop_event.wait(timeout=sleep_s)
+
+    def stop(self) -> None:
+        self.stop_event.set()
+
+
+class CPUSampler(threading.Thread):
+    def __init__(self, job_id: int, node: str, interval_s: float):
+        super().__init__(daemon=True)
+        self.job_id = job_id
+        self.node = node
+        self.interval_s = interval_s
+        self.stop_event = threading.Event()
+        self.samples: List[Dict[str, Any]] = []
+        self.errors: List[str] = []
+
+    def run(self) -> None:
+        while not self.stop_event.is_set():
+            t0 = time.time()
+            ts = datetime.now().isoformat()
+            proc = run_srun(self.job_id, self.node, CPU_SAMPLE_SCRIPT, timeout=25)
+            if proc.returncode == 0 and proc.stdout.strip():
+                try:
+                    sample = json.loads(proc.stdout.strip().splitlines()[-1])
+                    sample["ts"] = ts
+                    self.samples.append(sample)
+                    for err in sample.get("errors") or []:
+                        if err and err not in self.errors:
+                            self.errors.append(str(err)[:240])
+                except Exception as e:
+                    self.errors.append(f"cpu parse error: {e}")
             else:
                 err = proc.stderr.strip() or proc.stdout.strip()
                 if err:
@@ -1149,10 +1368,12 @@ def run_config_point(
         warmup_metrics.append(warm_task)
 
     sampler_gpu = GPUSampler(job_id=args.job_id, node=args.node, interval_s=args.gpu_sample_sec)
+    sampler_cpu = CPUSampler(job_id=args.job_id, node=args.node, interval_s=args.gpu_sample_sec)
     sampler_backend = BackendSampler(job_id=args.job_id, node=args.node, port=args.port, interval_s=2.0)
 
     start_dt = datetime.now()
     sampler_gpu.start()
+    sampler_cpu.start()
     sampler_backend.start()
 
     task_rows: List[Dict[str, Any]] = []
@@ -1265,13 +1486,23 @@ def run_config_point(
 
     end_dt = datetime.now()
     sampler_gpu.stop()
+    sampler_cpu.stop()
     sampler_backend.stop()
     sampler_gpu.join(timeout=20)
+    sampler_cpu.join(timeout=20)
     sampler_backend.join(timeout=20)
 
     task_rows = sorted(task_rows, key=lambda r: int(r.get("case_idx", -1)))
 
     for row in sampler_gpu.samples:
+        row.update(
+            {
+                "tp": config_point.tp,
+                "concurrency": config_point.concurrency,
+                "round": config_point.round_id,
+            }
+        )
+    for row in sampler_cpu.samples:
         row.update(
             {
                 "tp": config_point.tp,
@@ -1324,6 +1555,7 @@ def run_config_point(
     write_jsonl(metrics_dir / "inference_metrics.jsonl", inference_rows)
     write_jsonl(metrics_dir / "tool_metrics.jsonl", tool_rows)
     write_jsonl(metrics_dir / "gpu_samples.jsonl", sampler_gpu.samples)
+    write_jsonl(metrics_dir / "cpu_samples.jsonl", sampler_cpu.samples)
     write_jsonl(metrics_dir / "vllm_timeseries.jsonl", vllm_rows)
     write_jsonl(metrics_dir / "request_throughput_timeseries.jsonl", req_tps_rows)
     write_csv(metrics_dir / "energy_summary.csv", energy_rows)
@@ -1342,10 +1574,12 @@ def run_config_point(
         "exact_match_true": sum(1 for r in task_rows if r.get("exact_match") is True),
         "tool_calls": sum(int(r.get("tool_calls", 0)) for r in task_rows),
         "gpu_sample_count": len(sampler_gpu.samples),
+        "cpu_sample_count": len(sampler_cpu.samples),
         "backend_sample_count": len(sampler_backend.samples),
         "vllm_points": len(vllm_rows),
         "request_tps_points": len(req_tps_rows),
         "gpu_sampler_errors": sampler_gpu.errors,
+        "cpu_sampler_errors": sampler_cpu.errors,
         "backend_sampler_errors": sampler_backend.errors,
         "vllm_log": str(vllm_log_path),
     }
@@ -1373,13 +1607,14 @@ def validate_environment(args: argparse.Namespace, run_root: Path) -> None:
     if not Path(args.manage_backend_script).exists():
         raise FileNotFoundError(f"manage backend script not found: {args.manage_backend_script}")
 
-    sq = run_cmd(["squeue", "-j", str(args.job_id), "-o", "%.18i %.9P %.20j %.8u %.2t %.10M %.6D %R"], timeout=30)
-    if sq.returncode != 0:
-        raise RuntimeError(f"squeue failed: {sq.stderr}")
-    if str(args.job_id) not in sq.stdout:
-        raise RuntimeError(f"job {args.job_id} not found in squeue output")
-    if args.node not in sq.stdout:
-        log(f"warning: node {args.node} not shown in squeue line, continue anyway")
+    if not args.skip_slurm_validation:
+        sq = run_cmd(["squeue", "-j", str(args.job_id), "-o", "%.18i %.9P %.20j %.8u %.2t %.10M %.6D %R"], timeout=30)
+        if sq.returncode != 0:
+            raise RuntimeError(f"squeue failed: {sq.stderr}")
+        if str(args.job_id) not in sq.stdout:
+            raise RuntimeError(f"job {args.job_id} not found in squeue output")
+        if args.node not in sq.stdout:
+            log(f"warning: node {args.node} not shown in squeue line, continue anyway")
 
     roc = run_srun(args.job_id, args.node, "test -x /opt/rocm-default/bin/rocm-smi && echo ok", timeout=30)
     if roc.returncode != 0 or "ok" not in roc.stdout:
@@ -1404,8 +1639,9 @@ def infer_vllm_log(work_root: Path, base_url: str, port: int) -> Path:
 
 def main() -> int:
     args = parse_args()
+    os.environ["GAIA_REMOTE_RUNNER"] = args.remote_runner
     if args.enforce_eager:
-        log("warning: --enforce-eager is ignored (hard-disabled in launcher policy)")
+        log("enforce_eager=1; vLLM startup will skip compile/cudagraph capture")
     tp_list = parse_list_int(args.tp_list)
     conc_list = parse_list_int(args.concurrency_list)
 
@@ -1479,9 +1715,16 @@ def main() -> int:
     try:
         for tp in tp_list:
             run_tag = f"{run_root.name}_tp{tp}_p{args.port}"
-            base_url, endpoints = start_backend(args, tp=tp, run_tag=run_tag, work_root=work_root)
-            vllm_log_path = infer_vllm_log(work_root, base_url, args.port)
-            log(f"backend ready tp={tp} base_url={base_url} endpoints={endpoints}")
+            external_backend = bool(args.external_base_url)
+            if external_backend:
+                base_url = args.external_base_url
+                endpoints = Path(args.external_base_url)
+                vllm_log_path = Path(args.external_vllm_log) if args.external_vllm_log else infer_vllm_log(work_root, base_url, args.port)
+                log(f"external backend tp={tp} base_url={base_url} vllm_log={vllm_log_path}")
+            else:
+                base_url, endpoints = start_backend(args, tp=tp, run_tag=run_tag, work_root=work_root)
+                vllm_log_path = infer_vllm_log(work_root, base_url, args.port)
+                log(f"backend ready tp={tp} base_url={base_url} endpoints={endpoints}")
 
             tp_points = [p for p in points if p.tp == tp]
             for cp in tp_points:
@@ -1499,7 +1742,7 @@ def main() -> int:
                 for attempt in (1, 2):
                     healthy, detail = check_backend_health(args)
                     if not healthy:
-                        if attempt == 1:
+                        if attempt == 1 and not external_backend:
                             log(f"backend unhealthy before {cp.config_id}; restarting once. detail={detail}")
                             stop_backend(args, run_tag=run_tag, work_root=work_root)
                             base_url, endpoints = start_backend(args, tp=tp, run_tag=run_tag, work_root=work_root)
@@ -1530,7 +1773,7 @@ def main() -> int:
                         last_error = str(e)
                         if attempt == 1:
                             healthy_after, detail_after = check_backend_health(args)
-                            if not healthy_after:
+                            if not healthy_after and not external_backend:
                                 log(f"{cp.config_id} failed with unhealthy backend; restarting once. detail={detail_after}")
                                 stop_backend(args, run_tag=run_tag, work_root=work_root)
                                 base_url, endpoints = start_backend(args, tp=tp, run_tag=run_tag, work_root=work_root)
@@ -1545,16 +1788,18 @@ def main() -> int:
                     save_manifest(manifest_path, manifest)
                     log(f"config failed {cp.config_id}: {last_error}")
 
-            stop_backend(args, run_tag=run_tag, work_root=work_root)
-            log(f"backend stopped tp={tp}")
+            if not external_backend:
+                stop_backend(args, run_tag=run_tag, work_root=work_root)
+                log(f"backend stopped tp={tp}")
     finally:
         # best-effort cleanup for both TP tags
-        for tp in tp_list:
-            run_tag = f"{run_root.name}_tp{tp}_p{args.port}"
-            try:
-                stop_backend(args, run_tag=run_tag, work_root=work_root)
-            except Exception:
-                pass
+        if not args.external_base_url:
+            for tp in tp_list:
+                run_tag = f"{run_root.name}_tp{tp}_p{args.port}"
+                try:
+                    stop_backend(args, run_tag=run_tag, work_root=work_root)
+                except Exception:
+                    pass
 
     if not args.skip_report:
         report_cmd = [

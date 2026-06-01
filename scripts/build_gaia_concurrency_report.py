@@ -135,6 +135,7 @@ def aggregate_one_config(cfg_dir: Path) -> Dict[str, Any]:
     vllm_rows = read_jsonl(metrics / "vllm_timeseries.jsonl")
     req_rows = read_jsonl(metrics / "request_throughput_timeseries.jsonl")
     gpu_rows = read_jsonl(metrics / "gpu_samples.jsonl")
+    cpu_rows = read_jsonl(metrics / "cpu_samples.jsonl")
     energy_csv = metrics / "energy_summary.csv"
 
     tp, cc, rr = parse_config_key(cfg_dir.name)
@@ -220,6 +221,8 @@ def aggregate_one_config(cfg_dir: Path) -> Dict[str, Any]:
     gpu_use = lat_vals(gpu_rows, "gpu_use_pct")
     vram = lat_vals(gpu_rows, "vram_pct")
     power = lat_vals(gpu_rows, "power_w")
+    cpu_use = lat_vals(cpu_rows, "cpu_use_pct")
+    cpu_power = lat_vals(cpu_rows, "cpu_power_w")
     kv = lat_vals(vllm_rows, "gpu_kv_cache_pct")
     total_wh = 0.0
     energy_per_task_wh = 0.0
@@ -244,9 +247,12 @@ def aggregate_one_config(cfg_dir: Path) -> Dict[str, Any]:
         "vram_pct_mean": fmt(mean(vram) if vram else 0.0),
         "kv_cache_pct_mean": fmt(mean(kv) if kv else 0.0),
         "power_w_mean": fmt(mean(power) if power else 0.0),
+        "cpu_use_mean": fmt(mean(cpu_use) if cpu_use else 0.0),
+        "cpu_power_w_mean": fmt(mean(cpu_power) if cpu_power else 0.0),
         "total_energy_wh": fmt(total_wh),
         "energy_per_task_wh": fmt(energy_per_task_wh),
         "gpu_sample_count": len(gpu_rows),
+        "cpu_sample_count": len(cpu_rows),
     }
 
     return {
@@ -261,6 +267,7 @@ def aggregate_one_config(cfg_dir: Path) -> Dict[str, Any]:
         "vllm_rows": vllm_rows,
         "req_rows": req_rows,
         "gpu_rows": gpu_rows,
+        "cpu_rows": cpu_rows,
         "latency_summary": latency_summary,
         "success_summary": success_summary,
         "throughput_summary": throughput_summary,
@@ -531,8 +538,8 @@ def build_report_text(run_root: Path, aggregate: Dict[str, Any], plot_paths: Lis
     # compact KPI table by TP/Concurrency averaging rounds
     lines.append("## KPI (Averaged Over Rounds)")
     lines.append("")
-    lines.append("| TP | Concurrency | Task P50(s) | Task P95(s) | Task P99(s) | Task Success | Tool Success | Decode TPS | Req TPS | Energy/Task(Wh) |")
-    lines.append("|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+    lines.append("| TP | Concurrency | Task P50(s) | Task P95(s) | Task P99(s) | Task Success | Tool Success | Decode TPS | Req TPS | CPU Use(%) | CPU Power(W) | Energy/Task(Wh) |")
+    lines.append("|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
 
     by_key = defaultdict(lambda: {"lat": [], "succ": [], "thr": [], "res": []})
     for r in lat_rows:
@@ -557,7 +564,7 @@ def build_report_text(run_root: Path, aggregate: Dict[str, Any], plot_paths: Lis
             return mean(vals) if vals else 0.0
 
         lines.append(
-            f"| {tp} | {cc} | {gmean(group['lat'], 'task_p50'):.4f} | {gmean(group['lat'], 'task_p95'):.4f} | {gmean(group['lat'], 'task_p99'):.4f} | {gmean(group['succ'], 'task_success_rate'):.4f} | {gmean(group['succ'], 'tool_success_rate'):.4f} | {gmean(group['thr'], 'decode_tps_mean'):.4f} | {gmean(group['thr'], 'request_tps_mean'):.4f} | {gmean(group['res'], 'energy_per_task_wh'):.6f} |"
+            f"| {tp} | {cc} | {gmean(group['lat'], 'task_p50'):.4f} | {gmean(group['lat'], 'task_p95'):.4f} | {gmean(group['lat'], 'task_p99'):.4f} | {gmean(group['succ'], 'task_success_rate'):.4f} | {gmean(group['succ'], 'tool_success_rate'):.4f} | {gmean(group['thr'], 'decode_tps_mean'):.4f} | {gmean(group['thr'], 'request_tps_mean'):.4f} | {gmean(group['res'], 'cpu_use_mean'):.4f} | {gmean(group['res'], 'cpu_power_w_mean'):.4f} | {gmean(group['res'], 'energy_per_task_wh'):.6f} |"
         )
 
     lines.append("")
@@ -598,6 +605,7 @@ def main() -> int:
     all_vllm_rows: List[Dict[str, Any]] = []
     all_req_rows: List[Dict[str, Any]] = []
     all_gpu_rows: List[Dict[str, Any]] = []
+    all_cpu_rows: List[Dict[str, Any]] = []
 
     latency_summary_rows: List[Dict[str, Any]] = []
     success_summary_rows: List[Dict[str, Any]] = []
@@ -617,6 +625,7 @@ def main() -> int:
         all_vllm_rows.extend(one["vllm_rows"])
         all_req_rows.extend(one["req_rows"])
         all_gpu_rows.extend(one["gpu_rows"])
+        all_cpu_rows.extend(one["cpu_rows"])
 
         latency_summary_rows.append(one["latency_summary"])
         success_summary_rows.append(one["success_summary"])
@@ -633,6 +642,7 @@ def main() -> int:
     write_jsonl(aggregate_dir / "all_vllm_timeseries.jsonl", all_vllm_rows)
     write_jsonl(aggregate_dir / "all_request_throughput_timeseries.jsonl", all_req_rows)
     write_jsonl(aggregate_dir / "all_gpu_samples.jsonl", all_gpu_rows)
+    write_jsonl(aggregate_dir / "all_cpu_samples.jsonl", all_cpu_rows)
 
     write_csv(aggregate_dir / "latency_summary_by_config.csv", latency_summary_rows)
     write_csv(aggregate_dir / "success_summary_by_config.csv", success_summary_rows)

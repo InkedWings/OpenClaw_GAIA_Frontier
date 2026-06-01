@@ -24,8 +24,18 @@ TP_SIZE="${TP_SIZE:-8}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.95}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-24576}"
 ENFORCE_EAGER="${ENFORCE_EAGER:-0}"
+if [[ -z "${VLLM_CACHE_DIR:-}" ]]; then
+  if [[ -d "/mnt/bb" && -w "/mnt/bb" ]]; then
+    VLLM_CACHE_DIR="/mnt/bb/${USER}/openclaw_vllm_cache"
+  else
+    VLLM_CACHE_DIR="/tmp/${USER}/openclaw_vllm_cache"
+  fi
+fi
+TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-/tmp/triton/cache}"
+MIOPEN_CACHE_DIR="${MIOPEN_CACHE_DIR:-/tmp/${USER}/openclaw_miopen_cache}"
 VLLM_ENTRYPOINT="${VLLM_ENTRYPOINT:-api_server}"
 VLLM_PYTHONPATH="${VLLM_PYTHONPATH:-}"
+VLLM_LOG_STATS_INTERVAL="${VLLM_LOG_STATS_INTERVAL:-1}"
 ENABLE_AUTO_TOOL_CHOICE="${ENABLE_AUTO_TOOL_CHOICE:-1}"
 ENABLE_PREFIX_CACHING="${ENABLE_PREFIX_CACHING:-1}"
 TOOL_CALL_PARSER="${TOOL_CALL_PARSER:-}"
@@ -41,19 +51,14 @@ READY_TIMEOUT_S="${READY_TIMEOUT_S:-900}"
 READY_POLL_INTERVAL_S="${READY_POLL_INTERVAL_S:-10}"
 READY_CURL_TIMEOUT_S="${READY_CURL_TIMEOUT_S:-4}"
 
-# Hard-disable eager mode for benchmark consistency.
-if [[ "${ENFORCE_EAGER}" != "0" ]]; then
-  echo "[warn] ENFORCE_EAGER is disabled by script policy; forcing ENFORCE_EAGER=0"
-fi
-ENFORCE_EAGER="0"
-
 RUN_TAG="${RUN_TAG:-${SLURM_JOB_ID:-manual}_p${PORT}}"
 STATE_DIR="${WORK}/logs/vllm_launcher"
 LOG_DIR="${WORK}/logs"
 PID_FILE="${STATE_DIR}/${RUN_TAG}.pid"
 ENDPOINTS_FILE="${STATE_DIR}/${RUN_TAG}.endpoints.sh"
 SRUN_LOG="${STATE_DIR}/${RUN_TAG}.srun.log"
-mkdir -p "${STATE_DIR}" "${LOG_DIR}"
+mkdir -p "${STATE_DIR}" "${LOG_DIR}" "${VLLM_CACHE_DIR}" "${VLLM_CACHE_DIR}/torchinductor"
+export APPTAINERENV_TRITON_CACHE_DIR="${TRITON_CACHE_DIR}"
 
 mapfile -t HOSTS < <(scontrol show hostnames "${SLURM_JOB_NODELIST}")
 if [[ "${#HOSTS[@]}" -ne 1 ]]; then
@@ -224,11 +229,11 @@ start_backend() {
   fi
   local env_prefix
   # Avoid leaking launcher-only VLLM_* variables into vLLM's environment scan.
-  env_prefix="env -u VLLM_ENTRYPOINT -u VLLM_PYTHONPATH -u VLLM_EXTRA_ARGS OMP_NUM_THREADS=$(printf '%q' "${OMP_NUM_THREADS}")"
+  env_prefix="env -u VLLM_ENTRYPOINT -u VLLM_PYTHONPATH -u VLLM_EXTRA_ARGS -u VLLM_CACHE_DIR VLLM_LOG_STATS_INTERVAL=$(printf '%q' "${VLLM_LOG_STATS_INTERVAL}") OMP_NUM_THREADS=$(printf '%q' "${OMP_NUM_THREADS}") XDG_CACHE_HOME=$(printf '%q' "${VLLM_CACHE_DIR}") TORCHINDUCTOR_CACHE_DIR=$(printf '%q' "${VLLM_CACHE_DIR}/torchinductor") TRITON_CACHE_DIR=$(printf '%q' "${TRITON_CACHE_DIR}") MIOPEN_USER_DB_PATH=$(printf '%q' "${MIOPEN_CACHE_DIR}") MIOPEN_CUSTOM_CACHE_DIR=$(printf '%q' "${MIOPEN_CACHE_DIR}")"
   if [[ -n "${VLLM_PYTHONPATH}" ]]; then
     env_prefix="PYTHONPATH=$(printf '%q' "${VLLM_PYTHONPATH}") ${env_prefix}"
   fi
-  serve_cmd="${env_prefix} ${serve_cmd}"
+  serve_cmd="mkdir -p $(printf '%q' "${VLLM_CACHE_DIR}") $(printf '%q' "${VLLM_CACHE_DIR}/torchinductor") $(printf '%q' "${TRITON_CACHE_DIR}") $(printf '%q' "${MIOPEN_CACHE_DIR}") && ${env_prefix} ${serve_cmd}"
 
   nohup srun --jobid "${SLURM_TARGET_JOB_ID}" -N1 -n1 --nodelist "${HEAD_HOST}" --overlap \
     apptainer exec --fakeroot --writable-tmpfs "${IMG}" bash -lc "${serve_cmd}" \

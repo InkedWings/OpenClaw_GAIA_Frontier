@@ -49,6 +49,9 @@ if [[ -z "${OPENCLAW_CONTEXT_WINDOW:-}" ]]; then
   fi
 fi
 BACKEND_READY_TIMEOUT_S="${BACKEND_READY_TIMEOUT_S:-1800}"
+ENFORCE_EAGER="${ENFORCE_EAGER:-0}"
+VLLM_LOG_STATS_INTERVAL="${VLLM_LOG_STATS_INTERVAL:-1}"
+export VLLM_CACHE_DIR TRITON_CACHE_DIR MIOPEN_CACHE_DIR VLLM_LOG_STATS_INTERVAL
 
 mkdir -p "${GAIA_ROOT}/runs" "${WORK}/logs"
 
@@ -60,6 +63,7 @@ echo "[info] out_dir=${OUT_DIR}"
 echo "[info] tp_list=${TP_LIST} concurrency_list=${CONCURRENCY_LIST} rounds=${ROUNDS}"
 echo "[info] rows=${ROWS_JSONL} idx_range=[${IDX_START},${IDX_END}) case_mode=${CASE_MODE}"
 echo "[info] vllm_context_window=${VLLM_CONTEXT_WINDOW} openclaw_context_window=${OPENCLAW_CONTEXT_WINDOW} openclaw_max_output_tokens=${OPENCLAW_MAX_OUTPUT_TOKENS} margin=${OPENCLAW_CONTEXT_MARGIN}"
+echo "[info] enforce_eager=${ENFORCE_EAGER} vllm_log_stats_interval=${VLLM_LOG_STATS_INTERVAL} vllm_cache_dir=${VLLM_CACHE_DIR} triton_cache_dir=${TRITON_CACHE_DIR} miopen_cache_dir=${MIOPEN_CACHE_DIR}"
 echo "[info] backend_ready_timeout_s=${BACKEND_READY_TIMEOUT_S}"
 
 args=(
@@ -98,6 +102,7 @@ args=(
 )
 
 [[ "${DISABLE_VLLM_SPECULATIVE}" == "1" ]] && args+=(--disable-vllm-speculative)
+[[ "${ENFORCE_EAGER}" == "1" ]] && args+=(--enforce-eager)
 [[ "${RESUME}" == "1" ]] && args+=(--resume)
 [[ "${SKIP_REPORT}" == "1" ]] && args+=(--skip-report)
 
