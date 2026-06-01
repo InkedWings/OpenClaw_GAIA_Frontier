@@ -4,6 +4,7 @@ workspace/
 data/
 .agents/
 .codex/
+config/local.env
 *.log
 __pycache__/
 *.pyc

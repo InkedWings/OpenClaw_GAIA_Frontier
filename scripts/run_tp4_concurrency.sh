@@ -7,9 +7,16 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GAIA_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 CONFIG_FILE="${CONFIG_FILE:-${GAIA_ROOT}/config/tp4_concurrency.env}"
+LOCAL_CONFIG_FILE="${LOCAL_CONFIG_FILE:-${GAIA_ROOT}/config/local.env}"
 
 # shellcheck source=../config/tp4_concurrency.env
 source "${CONFIG_FILE}"
+if [[ -n "${LOCAL_CONFIG_FILE}" && -f "${LOCAL_CONFIG_FILE}" ]]; then
+  set -a
+  # shellcheck source=/dev/null
+  source "${LOCAL_CONFIG_FILE}"
+  set +a
+fi
 
 if [[ -z "${SLURM_JOB_ID:-}" ]]; then
   echo "[error] SLURM_JOB_ID is empty. Run this from salloc/sbatch." >&2
@@ -47,6 +54,7 @@ mkdir -p "${GAIA_ROOT}/runs" "${WORK}/logs"
 
 echo "[info] gaia_root=${GAIA_ROOT}"
 echo "[info] config=${CONFIG_FILE}"
+[[ -n "${LOCAL_CONFIG_FILE}" && -f "${LOCAL_CONFIG_FILE}" ]] && echo "[info] local_config=${LOCAL_CONFIG_FILE}"
 echo "[info] job_id=${SLURM_JOB_ID} node=${NODE}"
 echo "[info] out_dir=${OUT_DIR}"
 echo "[info] tp_list=${TP_LIST} concurrency_list=${CONCURRENCY_LIST} rounds=${ROUNDS}"
