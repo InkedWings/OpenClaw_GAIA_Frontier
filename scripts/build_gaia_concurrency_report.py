@@ -222,7 +222,6 @@ def aggregate_one_config(cfg_dir: Path) -> Dict[str, Any]:
     vram = lat_vals(gpu_rows, "vram_pct")
     power = lat_vals(gpu_rows, "power_w")
     cpu_use = lat_vals(cpu_rows, "cpu_use_pct")
-    cpu_power = lat_vals(cpu_rows, "cpu_power_w")
     kv = lat_vals(vllm_rows, "gpu_kv_cache_pct")
     total_wh = 0.0
     energy_per_task_wh = 0.0
@@ -248,7 +247,6 @@ def aggregate_one_config(cfg_dir: Path) -> Dict[str, Any]:
         "kv_cache_pct_mean": fmt(mean(kv) if kv else 0.0),
         "power_w_mean": fmt(mean(power) if power else 0.0),
         "cpu_use_mean": fmt(mean(cpu_use) if cpu_use else 0.0),
-        "cpu_power_w_mean": fmt(mean(cpu_power) if cpu_power else 0.0),
         "total_energy_wh": fmt(total_wh),
         "energy_per_task_wh": fmt(energy_per_task_wh),
         "gpu_sample_count": len(gpu_rows),
@@ -538,8 +536,8 @@ def build_report_text(run_root: Path, aggregate: Dict[str, Any], plot_paths: Lis
     # compact KPI table by TP/Concurrency averaging rounds
     lines.append("## KPI (Averaged Over Rounds)")
     lines.append("")
-    lines.append("| TP | Concurrency | Task P50(s) | Task P95(s) | Task P99(s) | Task Success | Tool Success | Decode TPS | Req TPS | CPU Use(%) | CPU Power(W) | Energy/Task(Wh) |")
-    lines.append("|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+    lines.append("| TP | Concurrency | Task P50(s) | Task P95(s) | Task P99(s) | Task Success | Tool Success | Decode TPS | Req TPS | CPU Use(%) | Energy/Task(Wh) |")
+    lines.append("|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
 
     by_key = defaultdict(lambda: {"lat": [], "succ": [], "thr": [], "res": []})
     for r in lat_rows:
@@ -564,7 +562,7 @@ def build_report_text(run_root: Path, aggregate: Dict[str, Any], plot_paths: Lis
             return mean(vals) if vals else 0.0
 
         lines.append(
-            f"| {tp} | {cc} | {gmean(group['lat'], 'task_p50'):.4f} | {gmean(group['lat'], 'task_p95'):.4f} | {gmean(group['lat'], 'task_p99'):.4f} | {gmean(group['succ'], 'task_success_rate'):.4f} | {gmean(group['succ'], 'tool_success_rate'):.4f} | {gmean(group['thr'], 'decode_tps_mean'):.4f} | {gmean(group['thr'], 'request_tps_mean'):.4f} | {gmean(group['res'], 'cpu_use_mean'):.4f} | {gmean(group['res'], 'cpu_power_w_mean'):.4f} | {gmean(group['res'], 'energy_per_task_wh'):.6f} |"
+            f"| {tp} | {cc} | {gmean(group['lat'], 'task_p50'):.4f} | {gmean(group['lat'], 'task_p95'):.4f} | {gmean(group['lat'], 'task_p99'):.4f} | {gmean(group['succ'], 'task_success_rate'):.4f} | {gmean(group['succ'], 'tool_success_rate'):.4f} | {gmean(group['thr'], 'decode_tps_mean'):.4f} | {gmean(group['thr'], 'request_tps_mean'):.4f} | {gmean(group['res'], 'cpu_use_mean'):.4f} | {gmean(group['res'], 'energy_per_task_wh'):.6f} |"
         )
 
     lines.append("")

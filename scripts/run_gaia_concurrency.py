@@ -45,7 +45,6 @@ REQUEST_COUNTER_CANDIDATES = [
 
 CPU_SAMPLE_SCRIPT = r"""
 python3 - <<'PY'
-import glob
 import json
 import os
 import time
@@ -59,16 +58,6 @@ def read_text(path):
         return ""
 
 
-def read_float(path):
-    txt = read_text(path)
-    if not txt:
-        return None
-    try:
-        return float(txt)
-    except Exception:
-        return None
-
-
 def read_proc_stat():
     line = read_text("/proc/stat").splitlines()[0]
     parts = line.split()
@@ -78,75 +67,12 @@ def read_proc_stat():
     return total, idle
 
 
-def read_powercap_energy():
-    out = {}
-    for energy_path in glob.glob("/sys/class/powercap/*/energy_uj"):
-        root = Path(energy_path).parent
-        name = read_text(root / "name") or root.name
-        energy = read_float(energy_path)
-        if energy is None:
-            continue
-        max_range = read_float(root / "max_energy_range_uj")
-        out[str(root)] = {
-            "name": name,
-            "energy_uj": energy,
-            "max_energy_range_uj": max_range,
-        }
-    return out
-
-
-def compute_powercap_watts(start, end, elapsed_s):
-    watts = []
-    for key, a in start.items():
-        b = end.get(key)
-        if not b:
-            continue
-        delta = b["energy_uj"] - a["energy_uj"]
-        max_range = a.get("max_energy_range_uj")
-        if delta < 0 and max_range:
-            delta += max_range
-        if delta < 0 or elapsed_s <= 0:
-            continue
-        watts.append({
-            "name": a.get("name") or key,
-            "watts": (delta / 1_000_000.0) / elapsed_s,
-        })
-    return watts
-
-
-def read_cray_cpu_power():
-    # On Cray EX systems, these counters may exist and are the best CPU-power source.
-    for path in (
-        "/sys/cray/pm_counters/cpu_power",
-        "/sys/cray/pm_counters/cpu_power_watts",
-    ):
-        val = read_float(path)
-        if val is not None:
-            return val, path
-    return None, ""
-
-
-def read_hwmon_cpu_power():
-    vals = []
-    for hwmon in glob.glob("/sys/class/hwmon/hwmon*"):
-        name = (read_text(Path(hwmon) / "name") or "").lower()
-        if not any(marker in name for marker in ("cpu", "amd_energy", "k10temp")):
-            continue
-        for p in glob.glob(f"{hwmon}/power*_input"):
-            val = read_float(p)
-            if val is None:
-                continue
-            vals.append({"name": name or Path(hwmon).name, "watts": val / 1_000_000.0})
-    return vals
-
-
 errors = []
 try:
     stat0 = read_proc_stat()
 except Exception as exc:
     stat0 = None
     errors.append(f"proc_stat_start: {exc}")
-energy0 = read_powercap_energy()
 t0 = time.time()
 time.sleep(0.25)
 try:
@@ -154,7 +80,6 @@ try:
 except Exception as exc:
     stat1 = None
     errors.append(f"proc_stat_end: {exc}")
-energy1 = read_powercap_energy()
 t1 = time.time()
 
 cpu_use_pct = None
@@ -171,25 +96,6 @@ try:
 except Exception as exc:
     errors.append(f"loadavg: {exc}")
 
-cpu_power_w = None
-cpu_power_source = ""
-cray_power, cray_source = read_cray_cpu_power()
-if cray_power is not None:
-    cpu_power_w = cray_power
-    cpu_power_source = cray_source
-else:
-    powercap = compute_powercap_watts(energy0, energy1, max(0.000001, t1 - t0))
-    if powercap:
-        cpu_power_w = sum(item["watts"] for item in powercap)
-        cpu_power_source = "powercap:" + ",".join(item["name"] for item in powercap)
-    else:
-        hwmon = read_hwmon_cpu_power()
-        if hwmon:
-            cpu_power_w = sum(item["watts"] for item in hwmon)
-            cpu_power_source = "hwmon:" + ",".join(item["name"] for item in hwmon)
-        else:
-            errors.append("cpu_power_unavailable")
-
 print(json.dumps({
     "hostname": os.uname().nodename,
     "cpu_count": os.cpu_count(),
@@ -197,8 +103,6 @@ print(json.dumps({
     "load1": load1,
     "load5": load5,
     "load15": load15,
-    "cpu_power_w": cpu_power_w,
-    "cpu_power_source": cpu_power_source,
     "errors": errors,
 }))
 PY
@@ -257,7 +161,7 @@ def parse_args() -> argparse.Namespace:
         help="Safety margin subtracted from the OpenClaw contextWindow auto-default to cover chat template/tool rendering overhead.",
     )
     parser.add_argument("--gpu-mem-util", type=float, default=0.95)
-    parser.add_argument("--model-max-tokens", type=int, default=8192)
+    parser.add_argument("--model-max-tokens", type=int, default=3584)
     parser.add_argument("--vllm-api-key", default="vllm-local")
     parser.add_argument(
         "--vllm-entrypoint",
@@ -439,6 +343,10 @@ def parse_list_int(spec: str) -> List[int]:
     return values
 
 
+def parse_list_str(spec: str) -> List[str]:
+    return [x.strip() for x in str(spec or "").split(",") if x.strip()]
+
+
 def is_qwen35_model(model: str) -> bool:
     return re.search(r"qwen3[._-]?5", str(model).lower()) is not None
 
@@ -569,15 +477,42 @@ def stop_backend(args: argparse.Namespace, run_tag: str, work_root: Path) -> Non
 
 
 def check_backend_health(args: argparse.Namespace) -> Tuple[bool, str]:
-    proc = run_srun(
-        args.job_id,
-        args.node,
-        f"curl -fsS --max-time 4 http://127.0.0.1:{args.port}/v1/models | grep -q '\"data\"' && echo ok",
-        timeout=25,
-    )
-    ok = proc.returncode == 0 and "ok" in (proc.stdout or "")
-    detail = (proc.stderr or proc.stdout or "").strip()
-    return ok, detail[:300]
+    ok_all = True
+    details: List[str] = []
+    base_urls = parse_list_str(args.external_base_url)
+    if base_urls:
+        if args.remote_runner == "srun":
+            return True, ""
+        for base_url in base_urls:
+            health_url = base_url.rstrip("/") + "/models"
+            try:
+                proc = run_cmd(["curl", "-fsS", "--max-time", "4", health_url], timeout=10)
+            except subprocess.TimeoutExpired:
+                proc = None
+            ok = proc is not None and proc.returncode == 0 and '"data"' in (proc.stdout or "")
+            ok_all = ok_all and ok
+            if not ok:
+                detail = "timeout" if proc is None else (proc.stderr or proc.stdout or "").strip()
+                details.append(f"{base_url}: {detail[:240]}")
+        return ok_all, "; ".join(details)[:500]
+
+    nodes = parse_list_str(args.node) or [args.node]
+    for node in nodes:
+        try:
+            proc = run_srun(
+                args.job_id,
+                node,
+                f"curl -fsS --max-time 4 http://127.0.0.1:{args.port}/v1/models | grep -q '\"data\"' && echo ok",
+                timeout=25,
+            )
+        except subprocess.TimeoutExpired:
+            proc = None
+        ok = proc is not None and proc.returncode == 0 and "ok" in (proc.stdout or "")
+        ok_all = ok_all and ok
+        if not ok:
+            detail = "timeout" if proc is None else (proc.stderr or proc.stdout or "").strip()
+            details.append(f"{node}: {detail[:240]}")
+    return ok_all, "; ".join(details)[:500]
 
 
 def extract_payload_answer(parsed: Dict[str, Any]) -> str:
@@ -856,11 +791,50 @@ def parse_metric_text(text: str) -> Dict[str, float]:
     return out
 
 
+def append_sampler_error(errors: List[str], message: Any, limit: int = 200) -> None:
+    msg = str(message).strip()
+    if not msg:
+        return
+    msg = msg[:240]
+    if msg in errors:
+        return
+    if len(errors) < limit:
+        errors.append(msg)
+
+
+class MultiSampler(threading.Thread):
+    def __init__(self, samplers: List[threading.Thread]):
+        super().__init__(daemon=True)
+        self.samplers = samplers
+        self.samples: List[Dict[str, Any]] = []
+        self.errors: List[str] = []
+
+    def start(self) -> None:
+        for sampler in self.samplers:
+            sampler.start()
+
+    def stop(self) -> None:
+        for sampler in self.samplers:
+            stop = getattr(sampler, "stop", None)
+            if callable(stop):
+                stop()
+
+    def join(self, timeout: Optional[float] = None) -> None:
+        for sampler in self.samplers:
+            sampler.join(timeout=timeout)
+        self.samples = []
+        self.errors = []
+        for sampler in self.samplers:
+            self.samples.extend(getattr(sampler, "samples", []))
+            self.errors.extend(getattr(sampler, "errors", []))
+
+
 class GPUSampler(threading.Thread):
-    def __init__(self, job_id: int, node: str, interval_s: float):
+    def __init__(self, job_id: int, node: str, interval_s: float, backend_id: int = 0):
         super().__init__(daemon=True)
         self.job_id = job_id
         self.node = node
+        self.backend_id = backend_id
         self.interval_s = interval_s
         self.stop_event = threading.Event()
         self.samples: List[Dict[str, Any]] = []
@@ -884,12 +858,27 @@ class GPUSampler(threading.Thread):
         while not self.stop_event.is_set():
             t0 = time.time()
             ts = datetime.now().isoformat()
-            proc = run_srun(
-                self.job_id,
-                self.node,
-                "/opt/rocm-default/bin/rocm-smi --showuse --showmemuse --showpower --showtemp --json 2>/dev/null",
-                timeout=20,
-            )
+            try:
+                proc = run_srun(
+                    self.job_id,
+                    self.node,
+                    "/opt/rocm-default/bin/rocm-smi --showuse --showmemuse --showpower --showtemp --json 2>/dev/null",
+                    timeout=20,
+                )
+            except subprocess.TimeoutExpired:
+                append_sampler_error(self.errors, f"gpu sample timeout node={self.node}")
+                dt = time.time() - t0
+                sleep_s = self.interval_s - dt
+                if sleep_s > 0:
+                    self.stop_event.wait(timeout=sleep_s)
+                continue
+            except Exception as e:
+                append_sampler_error(self.errors, f"gpu sample error node={self.node}: {e}")
+                dt = time.time() - t0
+                sleep_s = self.interval_s - dt
+                if sleep_s > 0:
+                    self.stop_event.wait(timeout=sleep_s)
+                continue
             if proc.returncode == 0 and proc.stdout.strip().startswith("{"):
                 try:
                     data = json.loads(proc.stdout)
@@ -898,6 +887,8 @@ class GPUSampler(threading.Thread):
                         gpu_id = int(m.group(1)) if m else -1
                         sample = {
                             "ts": ts,
+                            "node": self.node,
+                            "backend_id": self.backend_id,
                             "gpu_id": gpu_id,
                             "gpu_use_pct": self._parse_float(vals.get("GPU use (%)")),
                             "vram_pct": self._parse_float(vals.get("GPU Memory Allocated (VRAM%)")),
@@ -907,11 +898,11 @@ class GPUSampler(threading.Thread):
                         }
                         self.samples.append(sample)
                 except Exception as e:
-                    self.errors.append(f"gpu parse error: {e}")
+                    append_sampler_error(self.errors, f"gpu parse error node={self.node}: {e}")
             else:
                 err = proc.stderr.strip() or proc.stdout.strip()
                 if err:
-                    self.errors.append(err[:240])
+                    append_sampler_error(self.errors, f"gpu sample failed node={self.node}: {err}")
             dt = time.time() - t0
             sleep_s = self.interval_s - dt
             if sleep_s > 0:
@@ -922,10 +913,11 @@ class GPUSampler(threading.Thread):
 
 
 class CPUSampler(threading.Thread):
-    def __init__(self, job_id: int, node: str, interval_s: float):
+    def __init__(self, job_id: int, node: str, interval_s: float, backend_id: int = 0):
         super().__init__(daemon=True)
         self.job_id = job_id
         self.node = node
+        self.backend_id = backend_id
         self.interval_s = interval_s
         self.stop_event = threading.Event()
         self.samples: List[Dict[str, Any]] = []
@@ -935,21 +927,37 @@ class CPUSampler(threading.Thread):
         while not self.stop_event.is_set():
             t0 = time.time()
             ts = datetime.now().isoformat()
-            proc = run_srun(self.job_id, self.node, CPU_SAMPLE_SCRIPT, timeout=25)
+            try:
+                proc = run_srun(self.job_id, self.node, CPU_SAMPLE_SCRIPT, timeout=10)
+            except subprocess.TimeoutExpired:
+                append_sampler_error(self.errors, f"cpu sample timeout node={self.node}")
+                dt = time.time() - t0
+                sleep_s = self.interval_s - dt
+                if sleep_s > 0:
+                    self.stop_event.wait(timeout=sleep_s)
+                continue
+            except Exception as e:
+                append_sampler_error(self.errors, f"cpu sample error node={self.node}: {e}")
+                dt = time.time() - t0
+                sleep_s = self.interval_s - dt
+                if sleep_s > 0:
+                    self.stop_event.wait(timeout=sleep_s)
+                continue
             if proc.returncode == 0 and proc.stdout.strip():
                 try:
                     sample = json.loads(proc.stdout.strip().splitlines()[-1])
                     sample["ts"] = ts
+                    sample["node"] = self.node
+                    sample["backend_id"] = self.backend_id
                     self.samples.append(sample)
                     for err in sample.get("errors") or []:
-                        if err and err not in self.errors:
-                            self.errors.append(str(err)[:240])
+                        append_sampler_error(self.errors, f"cpu sample node={self.node}: {err}")
                 except Exception as e:
-                    self.errors.append(f"cpu parse error: {e}")
+                    append_sampler_error(self.errors, f"cpu parse error node={self.node}: {e}")
             else:
                 err = proc.stderr.strip() or proc.stdout.strip()
                 if err:
-                    self.errors.append(err[:240])
+                    append_sampler_error(self.errors, f"cpu sample failed node={self.node}: {err}")
             dt = time.time() - t0
             sleep_s = self.interval_s - dt
             if sleep_s > 0:
@@ -960,10 +968,11 @@ class CPUSampler(threading.Thread):
 
 
 class BackendSampler(threading.Thread):
-    def __init__(self, job_id: int, node: str, port: int, interval_s: float):
+    def __init__(self, job_id: int, node: str, port: int, interval_s: float, backend_id: int = 0):
         super().__init__(daemon=True)
         self.job_id = job_id
         self.node = node
+        self.backend_id = backend_id
         self.port = port
         self.interval_s = interval_s
         self.stop_event = threading.Event()
@@ -974,13 +983,28 @@ class BackendSampler(threading.Thread):
         while not self.stop_event.is_set():
             t0 = time.time()
             ts = datetime.now().isoformat()
-            proc = run_srun(
-                self.job_id,
-                self.node,
-                f"curl -fsS --max-time 3 http://127.0.0.1:{self.port}/metrics",
-                timeout=20,
-            )
-            row: Dict[str, Any] = {"ts": ts}
+            try:
+                proc = run_srun(
+                    self.job_id,
+                    self.node,
+                    f"curl -fsS --max-time 3 http://127.0.0.1:{self.port}/metrics",
+                    timeout=10,
+                )
+            except subprocess.TimeoutExpired:
+                append_sampler_error(self.errors, f"backend metrics timeout node={self.node}")
+                dt = time.time() - t0
+                sleep_s = self.interval_s - dt
+                if sleep_s > 0:
+                    self.stop_event.wait(timeout=sleep_s)
+                continue
+            except Exception as e:
+                append_sampler_error(self.errors, f"backend metrics error node={self.node}: {e}")
+                dt = time.time() - t0
+                sleep_s = self.interval_s - dt
+                if sleep_s > 0:
+                    self.stop_event.wait(timeout=sleep_s)
+                continue
+            row: Dict[str, Any] = {"ts": ts, "node": self.node, "backend_id": self.backend_id}
             if proc.returncode == 0:
                 metrics = parse_metric_text(proc.stdout)
                 for name in REQUEST_COUNTER_CANDIDATES:
@@ -990,7 +1014,7 @@ class BackendSampler(threading.Thread):
             else:
                 err = proc.stderr.strip() or proc.stdout.strip()
                 if err:
-                    self.errors.append(err[:240])
+                    append_sampler_error(self.errors, f"backend metrics failed node={self.node}: {err}")
             dt = time.time() - t0
             sleep_s = self.interval_s - dt
             if sleep_s > 0:
@@ -1032,6 +1056,21 @@ def parse_vllm_timeseries(log_path: Path, start_dt: datetime, end_dt: datetime) 
 
 def build_request_throughput_series(samples: List[Dict[str, Any]], task_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
+    groups: Dict[Tuple[Any, Any], List[Dict[str, Any]]] = defaultdict(list)
+    for sample in samples:
+        key = (sample.get("backend_id"), sample.get("node"))
+        if key != (None, None):
+            groups[key].append(sample)
+    if len(groups) > 1:
+        for (backend_id, node), group in sorted(groups.items(), key=lambda x: (str(x[0][0]), str(x[0][1]))):
+            for row in build_request_throughput_series(group, []):
+                row["backend_id"] = backend_id
+                row["node"] = node
+                rows.append(row)
+        if rows:
+            return rows
+        rows = []
+
     if len(samples) >= 2:
         samples_sorted = sorted(samples, key=lambda x: x.get("ts", ""))
         chosen_metric = ""
@@ -1163,6 +1202,7 @@ def run_one_task(
     config_point: ConfigPoint,
     row: Dict[str, Any],
     worker_id: int,
+    backend_node: Optional[str],
     worker_cfg: Path,
     worker_workspace: Path,
     config_raw_dir: Path,
@@ -1185,6 +1225,18 @@ def run_one_task(
 
     session_id = f"gaia_cc_{config_point.config_id}_idx{case_idx}_{uuid.uuid4().hex[:10]}"
     start_dt = datetime.now()
+    launcher_prefix: Optional[List[str]] = None
+    if args.remote_runner == "srun" and backend_node:
+        launcher_prefix = [
+            "srun",
+            "--overlap",
+            "--jobid",
+            str(args.job_id),
+            "-N1",
+            "-n1",
+            "--nodelist",
+            backend_node,
+        ]
     run_res = run_openclaw_agent(
         node_bin_dir=Path(args.node_bin_dir),
         openclaw_bin=Path(args.openclaw_bin),
@@ -1197,6 +1249,7 @@ def run_one_task(
             "HOME": str(runtime_home),
             "XDG_CACHE_HOME": str(runtime_home / ".cache"),
         },
+        launcher_prefix=launcher_prefix,
     )
     end_dt = datetime.now()
 
@@ -1308,11 +1361,12 @@ def run_config_point(
     args: argparse.Namespace,
     config_point: ConfigPoint,
     rows: List[Dict[str, Any]],
-    base_url: str,
+    base_urls: List[str],
+    backend_nodes: List[str],
     run_root: Path,
     openclaw_root: Path,
     template_cfg: Path,
-    vllm_log_path: Path,
+    vllm_log_paths: List[Path],
 ) -> Dict[str, Any]:
     cfg_dir = run_root / "configs" / f"tp{config_point.tp}_cc{config_point.concurrency}_r{config_point.round_id}"
     raw_dir = cfg_dir / "raw"
@@ -1329,7 +1383,15 @@ def run_config_point(
     ensure_dir(runtime_home)
     ensure_dir(runtime_home / ".cache")
     ensure_dir(session_store)
+    if not base_urls:
+        raise ValueError("at least one backend base URL is required")
+    if not backend_nodes:
+        backend_nodes = [args.node]
     for wid in range(config_point.concurrency):
+        backend_id = wid % len(base_urls)
+        config_base_url = base_urls[backend_id]
+        if args.remote_runner == "srun" and args.external_base_url:
+            config_base_url = f"http://127.0.0.1:{args.port}/v1"
         wdir = workers_dir / f"worker_{wid}"
         cfg_path = wdir / "openclaw.worker.json"
         workspace = wdir / "workspace"
@@ -1337,7 +1399,7 @@ def run_config_point(
             template_cfg=template_cfg,
             out_cfg=cfg_path,
             workspace=workspace,
-            base_url=base_url,
+            base_url=config_base_url,
             model_id=args.model,
             api_key=args.vllm_api_key,
             context_window=args.openclaw_context_window,
@@ -1355,6 +1417,7 @@ def run_config_point(
             config_point=config_point,
             row=warm,
             worker_id=0,
+            backend_node=backend_nodes[0] if backend_nodes else None,
             worker_cfg=worker_cfgs[0],
             worker_workspace=worker_workspaces[0],
             config_raw_dir=raw_dir,
@@ -1365,11 +1428,23 @@ def run_config_point(
         )
         warm_task = dict(warm_out.get("task_row", {}))
         warm_task["warmup_index"] = i
+        warm_task["backend_id"] = 0
+        warm_task["backend_url"] = base_urls[0]
+        warm_task["backend_node"] = backend_nodes[0]
         warmup_metrics.append(warm_task)
 
-    sampler_gpu = GPUSampler(job_id=args.job_id, node=args.node, interval_s=args.gpu_sample_sec)
-    sampler_cpu = CPUSampler(job_id=args.job_id, node=args.node, interval_s=args.gpu_sample_sec)
-    sampler_backend = BackendSampler(job_id=args.job_id, node=args.node, port=args.port, interval_s=2.0)
+    sampler_gpu = MultiSampler([
+        GPUSampler(job_id=args.job_id, node=node, interval_s=args.gpu_sample_sec, backend_id=i)
+        for i, node in enumerate(backend_nodes)
+    ])
+    sampler_cpu = MultiSampler([
+        CPUSampler(job_id=args.job_id, node=node, interval_s=args.gpu_sample_sec, backend_id=i)
+        for i, node in enumerate(backend_nodes)
+    ])
+    sampler_backend = MultiSampler([
+        BackendSampler(job_id=args.job_id, node=node, port=args.port, interval_s=2.0, backend_id=i)
+        for i, node in enumerate(backend_nodes)
+    ])
 
     start_dt = datetime.now()
     sampler_gpu.start()
@@ -1387,13 +1462,15 @@ def run_config_point(
 
     def _job(row_obj: Dict[str, Any]) -> Dict[str, Any]:
         wid = worker_queue.get()
+        backend_id = wid % len(base_urls)
         try:
             try:
-                return run_one_task(
+                result = run_one_task(
                     args=args,
                     config_point=config_point,
                     row=row_obj,
                     worker_id=wid,
+                    backend_node=backend_nodes[backend_id % len(backend_nodes)] if backend_nodes else None,
                     worker_cfg=worker_cfgs[wid],
                     worker_workspace=worker_workspaces[wid],
                     config_raw_dir=raw_dir,
@@ -1401,6 +1478,10 @@ def run_config_point(
                     runtime_home=runtime_home,
                     session_store=session_store,
                 )
+                result["task_row"]["backend_id"] = backend_id
+                result["task_row"]["backend_url"] = base_urls[backend_id]
+                result["task_row"]["backend_node"] = backend_nodes[backend_id % len(backend_nodes)]
+                return result
             except Exception as e:
                 case_idx = int(row_obj.get("idx", -1))
                 task_id = str(row_obj.get("task_id", ""))
@@ -1426,6 +1507,9 @@ def run_config_point(
                         "expected_answer": str(row_obj.get("final_answer", "")),
                         "answer_primary": "",
                         "worker_id": wid,
+                        "backend_id": backend_id,
+                        "backend_url": base_urls[backend_id],
+                        "backend_node": backend_nodes[backend_id % len(backend_nodes)],
                         "workspace": str(worker_workspaces[wid]),
                         "prompt_file": "",
                         "stdout_file": "",
@@ -1519,15 +1603,22 @@ def run_config_point(
             }
         )
 
-    vllm_rows = parse_vllm_timeseries(vllm_log_path, start_dt, end_dt)
-    for row in vllm_rows:
-        row.update(
-            {
-                "tp": config_point.tp,
-                "concurrency": config_point.concurrency,
-                "round": config_point.round_id,
-            }
-        )
+    vllm_rows: List[Dict[str, Any]] = []
+    for backend_id, log_path in enumerate(vllm_log_paths):
+        parsed_rows = parse_vllm_timeseries(log_path, start_dt, end_dt)
+        node = backend_nodes[backend_id % len(backend_nodes)] if backend_nodes else ""
+        for row in parsed_rows:
+            row.update(
+                {
+                    "tp": config_point.tp,
+                    "concurrency": config_point.concurrency,
+                    "round": config_point.round_id,
+                    "backend_id": backend_id,
+                    "node": node,
+                    "vllm_log": str(log_path),
+                }
+            )
+        vllm_rows.extend(parsed_rows)
 
     req_tps_rows = build_request_throughput_series(sampler_backend.samples, task_rows)
     for row in req_tps_rows:
@@ -1581,7 +1672,10 @@ def run_config_point(
         "gpu_sampler_errors": sampler_gpu.errors,
         "cpu_sampler_errors": sampler_cpu.errors,
         "backend_sampler_errors": sampler_backend.errors,
-        "vllm_log": str(vllm_log_path),
+        "backend_count": len(base_urls),
+        "backend_nodes": backend_nodes,
+        "backend_urls": base_urls,
+        "vllm_logs": [str(p) for p in vllm_log_paths],
     }
     write_json(metrics_dir / "config_summary.json", summary)
     return summary
@@ -1613,12 +1707,14 @@ def validate_environment(args: argparse.Namespace, run_root: Path) -> None:
             raise RuntimeError(f"squeue failed: {sq.stderr}")
         if str(args.job_id) not in sq.stdout:
             raise RuntimeError(f"job {args.job_id} not found in squeue output")
-        if args.node not in sq.stdout:
-            log(f"warning: node {args.node} not shown in squeue line, continue anyway")
+        for node in parse_list_str(args.node) or [args.node]:
+            if node not in sq.stdout:
+                log(f"warning: node {node} not shown in squeue line, continue anyway")
 
-    roc = run_srun(args.job_id, args.node, "test -x /opt/rocm-default/bin/rocm-smi && echo ok", timeout=30)
-    if roc.returncode != 0 or "ok" not in roc.stdout:
-        raise RuntimeError("/opt/rocm-default/bin/rocm-smi not executable on target node")
+        for node in parse_list_str(args.node) or [args.node]:
+            roc = run_srun(args.job_id, node, "test -x /opt/rocm-default/bin/rocm-smi && echo ok", timeout=30)
+            if roc.returncode != 0 or "ok" not in roc.stdout:
+                raise RuntimeError(f"/opt/rocm-default/bin/rocm-smi not executable on target node {node}")
 
     ensure_dir(run_root)
 
@@ -1679,6 +1775,7 @@ def main() -> int:
             "created_at": datetime.now().isoformat(),
             "job_id": args.job_id,
             "node": args.node,
+            "nodes": parse_list_str(args.node),
             "rows_jsonl": str(args.rows_jsonl),
             "case_mode": args.case_mode,
             "idx_start": args.idx_start,
@@ -1717,13 +1814,30 @@ def main() -> int:
             run_tag = f"{run_root.name}_tp{tp}_p{args.port}"
             external_backend = bool(args.external_base_url)
             if external_backend:
-                base_url = args.external_base_url
+                base_urls = parse_list_str(args.external_base_url)
+                backend_nodes = parse_list_str(args.node)
+                if len(backend_nodes) == 1 and len(base_urls) > 1:
+                    backend_nodes = []
+                    for url in base_urls:
+                        m = re.match(r"https?://([^:/]+):", url)
+                        backend_nodes.append(m.group(1) if m else args.node)
+                    args.node = ",".join(backend_nodes)
+                if len(backend_nodes) != len(base_urls):
+                    raise RuntimeError(f"--node count ({len(backend_nodes)}) must match --external-base-url count ({len(base_urls)})")
+                log_specs = parse_list_str(args.external_vllm_log)
+                if log_specs:
+                    if len(log_specs) != len(base_urls):
+                        raise RuntimeError(f"--external-vllm-log count ({len(log_specs)}) must match --external-base-url count ({len(base_urls)})")
+                    vllm_log_paths = [Path(x) for x in log_specs]
+                else:
+                    vllm_log_paths = [infer_vllm_log(work_root, url, args.port) for url in base_urls]
                 endpoints = Path(args.external_base_url)
-                vllm_log_path = Path(args.external_vllm_log) if args.external_vllm_log else infer_vllm_log(work_root, base_url, args.port)
-                log(f"external backend tp={tp} base_url={base_url} vllm_log={vllm_log_path}")
+                log(f"external backends tp={tp} count={len(base_urls)} base_urls={base_urls} vllm_logs={vllm_log_paths}")
             else:
                 base_url, endpoints = start_backend(args, tp=tp, run_tag=run_tag, work_root=work_root)
-                vllm_log_path = infer_vllm_log(work_root, base_url, args.port)
+                base_urls = [base_url]
+                backend_nodes = [args.node]
+                vllm_log_paths = [infer_vllm_log(work_root, base_url, args.port)]
                 log(f"backend ready tp={tp} base_url={base_url} endpoints={endpoints}")
 
             tp_points = [p for p in points if p.tp == tp]
@@ -1746,7 +1860,9 @@ def main() -> int:
                             log(f"backend unhealthy before {cp.config_id}; restarting once. detail={detail}")
                             stop_backend(args, run_tag=run_tag, work_root=work_root)
                             base_url, endpoints = start_backend(args, tp=tp, run_tag=run_tag, work_root=work_root)
-                            vllm_log_path = infer_vllm_log(work_root, base_url, args.port)
+                            base_urls = [base_url]
+                            backend_nodes = [args.node]
+                            vllm_log_paths = [infer_vllm_log(work_root, base_url, args.port)]
                             log(f"backend re-ready tp={tp} base_url={base_url} endpoints={endpoints}")
                             continue
                         raise RuntimeError(f"backend unhealthy before config start: {detail}")
@@ -1756,11 +1872,12 @@ def main() -> int:
                             args=args,
                             config_point=cp,
                             rows=rows,
-                            base_url=base_url,
+                            base_urls=base_urls,
+                            backend_nodes=backend_nodes,
                             run_root=run_root,
                             openclaw_root=openclaw_root,
                             template_cfg=template_cfg,
-                            vllm_log_path=vllm_log_path,
+                            vllm_log_paths=vllm_log_paths,
                         )
                         cfg_dir = run_root / "configs" / f"tp{cp.tp}_cc{cp.concurrency}_r{cp.round_id}"
                         write_json(cfg_dir / "metrics" / "config_summary.json", summary)
@@ -1777,7 +1894,9 @@ def main() -> int:
                                 log(f"{cp.config_id} failed with unhealthy backend; restarting once. detail={detail_after}")
                                 stop_backend(args, run_tag=run_tag, work_root=work_root)
                                 base_url, endpoints = start_backend(args, tp=tp, run_tag=run_tag, work_root=work_root)
-                                vllm_log_path = infer_vllm_log(work_root, base_url, args.port)
+                                base_urls = [base_url]
+                                backend_nodes = [args.node]
+                                vllm_log_paths = [infer_vllm_log(work_root, base_url, args.port)]
                                 log(f"backend re-ready tp={tp} base_url={base_url} endpoints={endpoints}")
                                 continue
                         last_error = str(e)

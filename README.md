@@ -70,7 +70,7 @@ IDX_START=0
 IDX_END=8
 VLLM_CONTEXT_WINDOW=32768
 OPENCLAW_CONTEXT_WINDOW=23552
-OPENCLAW_MAX_OUTPUT_TOKENS=4096
+OPENCLAW_MAX_OUTPUT_TOKENS=3584
 ENFORCE_EAGER=0
 VLLM_LOG_STATS_INTERVAL=1
 ```
@@ -120,6 +120,22 @@ IDX_END=40
 ```
 
 Set `IDX_END=-1` to run through the end of `ROWS_JSONL`.
+
+For the four-node Frontier sweep with one TP4 vLLM backend per node, prefer the
+`srun` path inside the existing allocation:
+
+```bash
+SLURM_TARGET_JOB_ID=4752225 \
+REMOTE_RUNNER=srun \
+NODES_CSV=frontier10362,frontier10363,frontier10365,frontier10366 \
+CONCURRENCY_LIST=2,4,8 \
+IDX_END=-1 \
+bash scripts/run_four_node_tp4_gaia_sweep.sh
+```
+
+The four-node script defaults to compiled vLLM, 1s vLLM stats logging, and
+`OPENCLAW_MAX_OUTPUT_TOKENS=3584` to avoid the observed 32768-token boundary
+overflow with 4096 output tokens.
 
 To run a larger concurrency sweep:
 
@@ -183,7 +199,7 @@ python scripts/run_gaia_concurrency.py \
   --timeout 600 \
   --max-model-len 32768 \
   --openclaw-context-window 23552 \
-  --model-max-tokens 4096 \
+  --model-max-tokens 3584 \
   --disable-vllm-speculative
 ```
 

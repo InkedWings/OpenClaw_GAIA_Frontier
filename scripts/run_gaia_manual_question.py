@@ -118,6 +118,7 @@ def run_openclaw_agent(
     timeout_s: int,
     cwd: Path,
     extra_env: Optional[Dict[str, str]] = None,
+    launcher_prefix: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     node_exe = node_bin_dir / "node"
     env = os.environ.copy()
@@ -148,6 +149,8 @@ def run_openclaw_agent(
         str(timeout_s),
         "--json",
     ]
+    if launcher_prefix:
+        cmd = [str(x) for x in launcher_prefix] + cmd
 
     t0 = time.time()
     hard_timeout_s = max(timeout_s + 30, timeout_s)
