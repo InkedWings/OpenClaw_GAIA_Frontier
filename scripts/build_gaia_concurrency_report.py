@@ -134,6 +134,7 @@ def aggregate_one_config(cfg_dir: Path) -> Dict[str, Any]:
     tool_rows = read_jsonl(metrics / "tool_metrics.jsonl")
     vllm_rows = read_jsonl(metrics / "vllm_timeseries.jsonl")
     req_rows = read_jsonl(metrics / "request_throughput_timeseries.jsonl")
+    backend_rows = read_jsonl(metrics / "backend_samples.jsonl")
     gpu_rows = read_jsonl(metrics / "gpu_samples.jsonl")
     cpu_rows = read_jsonl(metrics / "cpu_samples.jsonl")
     energy_csv = metrics / "energy_summary.csv"
@@ -264,6 +265,7 @@ def aggregate_one_config(cfg_dir: Path) -> Dict[str, Any]:
         "inference_rows": inf_rows,
         "vllm_rows": vllm_rows,
         "req_rows": req_rows,
+        "backend_rows": backend_rows,
         "gpu_rows": gpu_rows,
         "cpu_rows": cpu_rows,
         "latency_summary": latency_summary,
@@ -602,6 +604,7 @@ def main() -> int:
     all_inf_rows: List[Dict[str, Any]] = []
     all_vllm_rows: List[Dict[str, Any]] = []
     all_req_rows: List[Dict[str, Any]] = []
+    all_backend_rows: List[Dict[str, Any]] = []
     all_gpu_rows: List[Dict[str, Any]] = []
     all_cpu_rows: List[Dict[str, Any]] = []
 
@@ -622,6 +625,7 @@ def main() -> int:
         all_inf_rows.extend(one["inference_rows"])
         all_vllm_rows.extend(one["vllm_rows"])
         all_req_rows.extend(one["req_rows"])
+        all_backend_rows.extend(one["backend_rows"])
         all_gpu_rows.extend(one["gpu_rows"])
         all_cpu_rows.extend(one["cpu_rows"])
 
@@ -639,6 +643,7 @@ def main() -> int:
     write_jsonl(aggregate_dir / "all_inference_metrics.jsonl", all_inf_rows)
     write_jsonl(aggregate_dir / "all_vllm_timeseries.jsonl", all_vllm_rows)
     write_jsonl(aggregate_dir / "all_request_throughput_timeseries.jsonl", all_req_rows)
+    write_jsonl(aggregate_dir / "all_backend_samples.jsonl", all_backend_rows)
     write_jsonl(aggregate_dir / "all_gpu_samples.jsonl", all_gpu_rows)
     write_jsonl(aggregate_dir / "all_cpu_samples.jsonl", all_cpu_rows)
 

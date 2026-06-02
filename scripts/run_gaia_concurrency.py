@@ -778,14 +778,14 @@ def parse_metric_text(text: str) -> Dict[str, float]:
         s = line.strip()
         if not s or s.startswith("#"):
             continue
-        if "{" in s:
-            continue
         parts = s.split()
         if len(parts) != 2:
             continue
         name, value = parts[0], parts[1]
+        if "{" in name:
+            name = name.split("{", 1)[0]
         try:
-            out[name] = float(value)
+            out[name] = out.get(name, 0.0) + float(value)
         except Exception:
             continue
     return out
@@ -1647,6 +1647,7 @@ def run_config_point(
     write_jsonl(metrics_dir / "tool_metrics.jsonl", tool_rows)
     write_jsonl(metrics_dir / "gpu_samples.jsonl", sampler_gpu.samples)
     write_jsonl(metrics_dir / "cpu_samples.jsonl", sampler_cpu.samples)
+    write_jsonl(metrics_dir / "backend_samples.jsonl", sampler_backend.samples)
     write_jsonl(metrics_dir / "vllm_timeseries.jsonl", vllm_rows)
     write_jsonl(metrics_dir / "request_throughput_timeseries.jsonl", req_tps_rows)
     write_csv(metrics_dir / "energy_summary.csv", energy_rows)

@@ -87,6 +87,7 @@ Useful files in each run:
 - `aggregate/throughput_summary_by_config.csv`: vLLM and request throughput.
 - `aggregate/resource_summary_by_config.csv`: GPU/CPU/resource summaries.
 - `aggregate/all_vllm_timeseries.jsonl`: parsed vLLM stats log points.
+- `aggregate/all_backend_samples.jsonl`: raw vLLM `/metrics` counter samples.
 - `configs/tp*_cc*_r*/metrics/task_metrics.jsonl`: per-task outcomes.
 - `configs/tp*_cc*_r*/metrics/gpu_samples.jsonl`: per-GPU samples.
 - `configs/tp*_cc*_r*/metrics/cpu_samples.jsonl`: CPU usage samples.
@@ -121,17 +122,22 @@ IDX_END=40
 
 Set `IDX_END=-1` to run through the end of `ROWS_JSONL`.
 
-For the four-node Frontier sweep with one TP4 vLLM backend per node, prefer the
-`srun` path inside the existing allocation:
+For the four-node Frontier sweep with one TP4 vLLM backend per node, prefer SSH
+for the GAIA/OpenClaw runner. The vLLM backends can stay inside the existing
+allocation, while OpenClaw runs locally and talks to each backend by node URL.
+This avoids consuming one Slurm step per GAIA case.
 
 ```bash
-SLURM_TARGET_JOB_ID=4752225 \
-REMOTE_RUNNER=srun \
+REMOTE_RUNNER=ssh \
 NODES_CSV=frontier10362,frontier10363,frontier10365,frontier10366 \
-CONCURRENCY_LIST=2,4,8 \
+CONCURRENCY_LIST=2 \
 IDX_END=-1 \
 bash scripts/run_four_node_tp4_gaia_sweep.sh
 ```
+
+`REMOTE_RUNNER=srun` is still useful when SSH is unavailable or for short
+debugging runs, but full validation runs can hit the job step limit because the
+four persistent vLLM backends already occupy Slurm steps.
 
 The four-node script defaults to compiled vLLM, 1s vLLM stats logging, and
 `OPENCLAW_MAX_OUTPUT_TOKENS=3584` to avoid the observed 32768-token boundary
